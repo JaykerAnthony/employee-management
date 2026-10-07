@@ -1,0 +1,12 @@
+.DS_Store
+**/.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.pfx
+*.publishsettings
+node_modules/
+dist/
+target/
+*.log

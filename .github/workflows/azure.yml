@@ -1,0 +1,144 @@
+name: Build and deploy to Azure
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: azure-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  backend:
+    name: Test and package backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+          cache-dependency-path: backend/employee-management/pom.xml
+      - name: Verify backend (isolated test database)
+        working-directory: backend/employee-management
+        run: ./mvnw -B -ntp clean verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend
+          path: backend/employee-management/target/employee-management.jar
+          if-no-files-found: error
+          retention-days: 7
+
+  frontend:
+    name: Lint and build frontend
+    runs-on: ubuntu-latest
+    env:
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Validate production API origin before a deployment
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.AZURE_DEPLOY_ENABLED == 'true'))
+        run: |
+          node --input-type=module <<'JS'
+          const value = process.env.VITE_API_BASE_URL;
+          const url = new URL(value);
+          if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') {
+            throw new Error('VITE_API_BASE_URL must be an HTTPS origin without an /api path, query, or credentials');
+          }
+          JS
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run lint && npm run build
+        working-directory: frontend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy-backend:
+    name: Deploy backend to App Service
+    needs: [backend, frontend]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && vars.AZURE_DEPLOY_ENABLED == 'true'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check deployment configuration
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+          SWA_TOKEN: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+        run: |
+          for name in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID AZURE_WEBAPP_NAME SWA_TOKEN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing $name. Follow docs/AZURE_DEPLOYMENT.md."
+              exit 1
+            fi
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: backend
+          path: backend-artifact
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          package: backend-artifact/employee-management.jar
+      - name: Wait for backend and database health
+        env:
+          API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: |
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error --max-time 15 "${API_BASE_URL%/}/actuator/health" | jq -e '.status == "UP"'; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo '::error::Backend is unhealthy. Check App Service Log stream, database credentials, and MySQL firewall.'
+          exit 1
+
+  deploy-frontend:
+    name: Deploy frontend to Static Web Apps
+    needs: [frontend, deploy-backend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend
+          path: frontend-dist
+      - uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
+          action: upload
+          app_location: frontend-dist
+          api_location: ''
+          output_location: ''
+          skip_app_build: true
+          skip_api_build: true
+          production_branch: main
